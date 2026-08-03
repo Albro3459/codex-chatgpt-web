@@ -1,5 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const Module = require("node:module");
 const fs = require("node:fs");
 const path = require("node:path");
 const {
@@ -911,23 +912,35 @@ test("a later provider round reuses its task tab and restores active ownership",
   assert.deepEqual(events, ["visible", "published", "descriptor", "browser.tab_reused"]);
 });
 
-test("five running browser tabs are a hard account-safety limit", () => {
-  const turnTabs = new Map(Array.from({ length: 5 }, (_unused, index) => [
+test("unended error tabs are not evictable", () => {
+  const turnTabs = new Map([
+    ["tab-error", { status: "error", ended: false }],
+    ["tab-aborted", { status: "aborted" }],
+  ]);
+
+  assert.equal(evictableTurnTabId(turnTabs), null);
+});
+
+test("five unended browser tabs reject a sixth regardless of status", () => {
+  const statuses = ["error", "aborted", "ready", "error", "aborted"];
+  const turnTabs = new Map(statuses.map((status, index) => [
     `tab-${index + 1}`,
-    { ordinal: index + 1, status: "running" },
+    { ordinal: index + 1, status, ended: false },
   ]));
+  const before = [...turnTabs.entries()];
 
   assert.throws(
     () => BrowserHost.prototype.createTurnTab.call({ turnTabs }, "trace_six", 444),
     /already has 5 browser tabs running a turn\. Close one or wait for one to finish.*avoid excessive parallel traffic/,
   );
+  assert.deepEqual([...turnTabs.entries()], before);
 });
 
-test("a new browser turn at the tab limit evicts the oldest finished tab", () => {
+test("view allocation failure preserves the existing ended tab set", () => {
   const statuses = ["running", "ready", "running", "error", "running"];
   const turnTabs = new Map(statuses.map((status, index) => [
     `tab-${index + 1}`,
-    { ordinal: index + 1, status },
+    { ordinal: index + 1, status, ended: status !== "running" },
   ]));
   const closed = [];
   const fixture = Object.assign(Object.create(BrowserHost.prototype), {
@@ -937,22 +950,119 @@ test("a new browser turn at the tab limit evicts the oldest finished tab", () =>
       turnTabs.delete(tabId);
     },
   });
+  const before = [...turnTabs.entries()];
 
-  // WebContentsView is unavailable outside Electron, so creation fails right after the eviction.
+  // WebContentsView is unavailable outside Electron, so allocation fails before eviction.
   assert.throws(
     () => BrowserHost.prototype.createTurnTab.call(fixture, "trace_six", 444),
     TypeError,
   );
-  assert.deepEqual(closed, ["tab-2"]);
+  assert.deepEqual(closed, []);
+  assert.deepEqual([...turnTabs.entries()], before);
 });
 
-test("the oldest non-running browser tab is the evictable one", () => {
-  const tabs = (statuses) => new Map(statuses.map((status, index) => [`tab-${index + 1}`, { status }]));
+function loadBrowserHostWithViewConstructor(ViewConstructor) {
+  const browserHostPath = require.resolve("../electron/browser-host.cjs");
+  const previousModule = require.cache[browserHostPath];
+  const originalLoad = Module._load;
+  delete require.cache[browserHostPath];
+  Module._load = function load(request, parent, isMain) {
+    if (request === "electron") {
+      return { WebContentsView: ViewConstructor, shell: { openExternal() {} } };
+    }
+    return originalLoad.call(this, request, parent, isMain);
+  };
+  try {
+    return require(browserHostPath);
+  } finally {
+    Module._load = originalLoad;
+    delete require.cache[browserHostPath];
+    if (previousModule) require.cache[browserHostPath] = previousModule;
+  }
+}
+
+function createFakeBrowserView() {
+  const webContents = {
+    setWindowOpenHandler() {},
+    on() {},
+    isDestroyed: () => false,
+    close() {},
+    setBackgroundThrottling() {},
+    loadURL: () => Promise.resolve(),
+  };
+  return {
+    webContents,
+    setBounds() {},
+    setVisible() {},
+  };
+}
+
+test("successful creation evicts the oldest ended tab and reuses its ordinal", () => {
+  const allocated = [];
+  class FakeWebContentsView {
+    constructor() {
+      const view = createFakeBrowserView();
+      allocated.push(view);
+      return view;
+    }
+  }
+  const { BrowserHost: FakeBrowserHost } = loadBrowserHostWithViewConstructor(FakeWebContentsView);
+  const removed = [];
+  const evictedView = createFakeBrowserView();
+  const turnTabs = new Map(["running", "error", "aborted", "ready", "running"].map((status, index) => {
+    const tab = {
+      id: `tab-${index + 1}`,
+      ordinal: index + 1,
+      status,
+      ended: status === "error" || status === "ready",
+      view: index === 1 ? evictedView : createFakeBrowserView(),
+    };
+    return [tab.id, tab];
+  }));
+  const fixture = Object.assign(Object.create(FakeBrowserHost.prototype), {
+    turnTabs,
+    selectedTabId: "home",
+    bounds: { x: 0, y: 0, width: 800, height: 600 },
+    window: {
+      contentView: {
+        addChildView() {},
+        removeChildView: (view) => removed.push(view),
+      },
+    },
+    closedTurnOwners: new Map(),
+    syncViewVisibility() {},
+    snapshot() { return { tabs: [] }; },
+    publishState() {},
+    writeDescriptor() {},
+    logger: { info() {} },
+  });
+
+  const created = FakeBrowserHost.prototype.createTurnTab.call(fixture, "trace_six", 444);
+
+  assert.equal(allocated.length, 1);
+  assert.equal(created.ordinal, 2);
+  assert.equal(created.label, "ChatGPT 2");
+  assert.deepEqual(removed, [evictedView]);
+  assert.equal(turnTabs.has("tab-2"), false);
+  assert.equal([...turnTabs.values()].at(-1), created);
+});
+
+test("the oldest ended browser tab is the evictable one", () => {
+  const tabs = (entries) => new Map(entries.map(([status, ended], index) => [
+    `tab-${index + 1}`,
+    { status, ended },
+  ]));
 
   assert.equal(evictableTurnTabId(new Map()), null);
-  assert.equal(evictableTurnTabId(tabs(["running", "running", "running"])), null);
-  assert.equal(evictableTurnTabId(tabs(["running", "ready", "error", "running"])), "tab-2");
-  assert.equal(evictableTurnTabId(tabs(["ready", "aborted", "error"])), "tab-1");
+  assert.equal(evictableTurnTabId(tabs([["running", false], ["running", false], ["running", false]])), null);
+  assert.equal(
+    evictableTurnTabId(tabs([["running", false], ["ready", true], ["error", true], ["running", false]])),
+    "tab-2",
+  );
+  assert.equal(
+    evictableTurnTabId(tabs([["ready", true], ["aborted", true], ["error", true]])),
+    "tab-1",
+  );
 });
 
 function createTurnTabHost(tabs, selectedTabId) {

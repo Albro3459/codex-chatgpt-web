@@ -194,20 +194,23 @@ class BrowserHost {
   }
 
   createTurnTab(traceId, helperPid) {
+    let evictedId = null;
+    let ordinal;
     if (this.turnTabs.size >= MAX_BROWSER_TABS) {
-      const evictedId = evictableTurnTabId(this.turnTabs);
+      evictedId = evictableTurnTabId(this.turnTabs);
       if (!evictedId) {
         throw new Error(
           `ChatGPT Web already has ${MAX_BROWSER_TABS} browser tabs running a turn. Close one or wait for one to finish before starting another turn to avoid excessive parallel traffic on the ChatGPT account.`,
         );
       }
-      this.closeTab(evictedId);
+      ordinal = this.turnTabs.get(evictedId).ordinal;
+    } else {
+      ordinal = Array.from({ length: MAX_BROWSER_TABS }, (_unused, index) => index + 1)
+        .find(candidate => ![...this.turnTabs.values()].some(tab => tab.ordinal === candidate));
+      if (!ordinal) throw new Error("ChatGPT Web browser tab allocation is inconsistent");
     }
     const id = randomBytes(12).toString("base64url");
     const surfaceId = randomBytes(24).toString("base64url");
-    const ordinal = Array.from({ length: MAX_BROWSER_TABS }, (_unused, index) => index + 1)
-      .find(candidate => ![...this.turnTabs.values()].some(tab => tab.ordinal === candidate));
-    if (!ordinal) throw new Error("ChatGPT Web browser tab allocation is inconsistent");
     const view = new WebContentsView({
       webPreferences: {
         partition: CHATGPT_PARTITION,
@@ -218,6 +221,21 @@ class BrowserHost {
         backgroundThrottling: false,
       },
     });
+    const cleanup = () => {
+      this.turnTabs.delete(id);
+      try { this.window.contentView.removeChildView(view); } catch {}
+      try {
+        if (!view.webContents.isDestroyed()) view.webContents.close();
+      } catch {}
+    };
+    if (evictedId) {
+      try {
+        this.closeTab(evictedId);
+      } catch (error) {
+        cleanup();
+        throw error;
+      }
+    }
     const tab = {
       id,
       surfaceId,
@@ -234,16 +252,21 @@ class BrowserHost {
       ended: false,
     };
     this.turnTabs.set(id, tab);
-    this.window.contentView.addChildView(view);
-    view.setBounds(this.bounds);
-    view.setVisible(false);
-    this.bindTurnContents(tab);
-    void view.webContents.loadURL(IDLE_BROWSER_URL).catch((error) => {
-      tab.status = "error";
-      tab.loading = false;
-      tab.message = error instanceof Error ? error.message : String(error);
-      this.publishState?.(this.snapshot());
-    });
+    try {
+      this.window.contentView.addChildView(view);
+      view.setBounds(this.bounds);
+      view.setVisible(false);
+      this.bindTurnContents(tab);
+      void view.webContents.loadURL(IDLE_BROWSER_URL).catch((error) => {
+        tab.status = "error";
+        tab.loading = false;
+        tab.message = error instanceof Error ? error.message : String(error);
+        this.publishState?.(this.snapshot());
+      });
+    } catch (error) {
+      cleanup();
+      throw error;
+    }
     return tab;
   }
 

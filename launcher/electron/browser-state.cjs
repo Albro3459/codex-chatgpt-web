@@ -43,7 +43,7 @@ function navigateBrowser(contents, action) {
 
 function evictableTurnTabId(turnTabs) {
   for (const [id, tab] of turnTabs) {
-    if (tab.status !== "running") return id;
+    if (tab.ended === true) return id;
   }
   return null;
 }
