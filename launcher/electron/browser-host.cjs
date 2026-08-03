@@ -538,7 +538,8 @@ class BrowserHost {
       );
     }
     const tab = this.turnTabs.get(tabId);
-    if (isLiveTurnTab(tab) && force !== true) {
+    const turnAborted = isLiveTurnTab(tab);
+    if (turnAborted && force !== true) {
       throw new Error(
         `ChatGPT Web browser tab ${tab.ordinal} is still running turn ${tab.traceId}; pass --force to close it and abort that turn`,
       );
@@ -549,6 +550,7 @@ class BrowserHost {
       label: tab.label,
       status: tab.status,
       traceId: tab.traceId,
+      turnAborted,
     };
     this.closeTab(tab.id);
     return { closed };
@@ -558,6 +560,7 @@ class BrowserHost {
     const closed = [];
     const skipped = [];
     for (const tab of [...this.turnTabs.values()]) {
+      const turnAborted = isLiveTurnTab(tab);
       const entry = {
         id: tab.id,
         ordinal: tab.ordinal,
@@ -565,11 +568,11 @@ class BrowserHost {
         status: tab.status,
         traceId: tab.traceId,
       };
-      if (force !== true && isLiveTurnTab(tab)) {
+      if (force !== true && turnAborted) {
         skipped.push(entry);
         continue;
       }
-      closed.push(entry);
+      closed.push({ ...entry, turnAborted });
       this.closeTab(tab.id);
     }
     return { maxTabs: MAX_BROWSER_TABS, closed, skipped };

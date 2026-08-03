@@ -258,6 +258,10 @@ export interface LauncherBrowserTab {
 
 export type LauncherBrowserTabEntry = Omit<LauncherBrowserTab, "active">;
 
+export type LauncherBrowserTabClosedEntry = LauncherBrowserTabEntry & {
+  turnAborted: boolean;
+};
+
 export interface LauncherBrowserTabList {
   maxTabs: number;
   activeTabId: string;
@@ -265,12 +269,12 @@ export interface LauncherBrowserTabList {
 }
 
 export interface LauncherBrowserTabClosure {
-  closed: LauncherBrowserTabEntry;
+  closed: LauncherBrowserTabClosedEntry;
 }
 
 export interface LauncherBrowserTabPrune {
   maxTabs: number;
-  closed: LauncherBrowserTabEntry[];
+  closed: LauncherBrowserTabClosedEntry[];
   skipped: LauncherBrowserTabEntry[];
 }
 
@@ -332,6 +336,20 @@ function parseTabEntries(value: unknown): LauncherBrowserTabEntry[] {
   return value.map(entry => parseTabEntry(entry));
 }
 
+function parseClosedTabEntry(value: unknown): LauncherBrowserTabClosedEntry {
+  const entry = parseTabEntry(value);
+  const turnAborted = (value as { turnAborted?: unknown } | null)?.turnAborted;
+  if (typeof turnAborted !== "boolean") {
+    throw new Error("Launcher returned an invalid closed browser tab entry");
+  }
+  return { ...entry, turnAborted };
+}
+
+function parseClosedTabEntries(value: unknown): LauncherBrowserTabClosedEntry[] {
+  if (!Array.isArray(value)) throw new Error("Launcher returned an invalid browser tab list");
+  return value.map(entry => parseClosedTabEntry(entry));
+}
+
 export async function listLauncherBrowserTabs(descriptorPath: string): Promise<LauncherBrowserTabList> {
   return await requestLauncherTabs(descriptorPath, "/v1/tabs/list", {}, body => {
     if (!Number.isInteger(body.maxTabs) || typeof body.activeTabId !== "string") {
@@ -359,7 +377,7 @@ export async function closeLauncherBrowserTab(
     descriptorPath,
     "/v1/tabs/close",
     { ref, force },
-    body => ({ closed: parseTabEntry(body.closed) }),
+    body => ({ closed: parseClosedTabEntry(body.closed) }),
   );
 }
 
@@ -371,7 +389,7 @@ export async function pruneLauncherBrowserTabs(
     if (!Number.isInteger(body.maxTabs)) throw new Error("Launcher returned an invalid browser tab list");
     return {
       maxTabs: body.maxTabs as number,
-      closed: parseTabEntries(body.closed),
+      closed: parseClosedTabEntries(body.closed),
       skipped: parseTabEntries(body.skipped),
     };
   });

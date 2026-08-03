@@ -168,13 +168,13 @@ test("launcher tab control lists, closes, and prunes over the authenticated chan
     }
     if (request.url === "/v1/tabs/close") {
       response.end(JSON.stringify({
-        closed: { id: "tab-1", ordinal: 1, label: "Task 1", status: "running", traceId: "trace_one" },
+        closed: { id: "tab-1", ordinal: 1, label: "Task 1", status: "running", traceId: "trace_one", turnAborted: true },
       }));
       return;
     }
     response.end(JSON.stringify({
       maxTabs: 5,
-      closed: [{ id: "tab-2", ordinal: 2, label: "Task 2", status: "ready", traceId: null }],
+      closed: [{ id: "tab-2", ordinal: 2, label: "Task 2", status: "ready", traceId: null, turnAborted: false }],
       skipped: [{ id: "tab-1", ordinal: 1, label: "Task 1", status: "running", traceId: "trace_one" }],
     }));
   });
@@ -196,11 +196,11 @@ test("launcher tab control lists, closes, and prunes over the authenticated chan
       ],
     });
     expect(await closeLauncherBrowserTab(path, "1", true)).toEqual({
-      closed: { id: "tab-1", ordinal: 1, label: "Task 1", status: "running", traceId: "trace_one" },
+      closed: { id: "tab-1", ordinal: 1, label: "Task 1", status: "running", traceId: "trace_one", turnAborted: true },
     });
     expect(await pruneLauncherBrowserTabs(path, false)).toEqual({
       maxTabs: 5,
-      closed: [{ id: "tab-2", ordinal: 2, label: "Task 2", status: "ready", traceId: null }],
+      closed: [{ id: "tab-2", ordinal: 2, label: "Task 2", status: "ready", traceId: null, turnAborted: false }],
       skipped: [{ id: "tab-1", ordinal: 1, label: "Task 1", status: "running", traceId: "trace_one" }],
     });
 
@@ -244,7 +244,7 @@ test("launcher tab control rejects malformed tab payloads", async () => {
     response.writeHead(200, { "content-type": "application/json" });
     response.end(request.url === "/v1/tabs/list"
       ? JSON.stringify({ maxTabs: 5, activeTabId: "tab-1", tabs: "tab-1" })
-      : JSON.stringify({ closed: { id: "tab-1", ordinal: 1, label: "Task 1" } }));
+      : JSON.stringify({ closed: { id: "tab-1", ordinal: 1, label: "Task 1", status: "ready", traceId: null } }));
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -258,7 +258,7 @@ test("launcher tab control rejects malformed tab payloads", async () => {
       "Launcher browser control channel failed: Launcher returned an invalid browser tab list",
     );
     await expect(closeLauncherBrowserTab(path, "1", false)).rejects.toThrow(
-      "Launcher browser control channel failed: Launcher returned an invalid browser tab entry",
+      "Launcher browser control channel failed: Launcher returned an invalid closed browser tab entry",
     );
   } finally {
     await new Promise<void>(resolve => server.close(() => resolve()));

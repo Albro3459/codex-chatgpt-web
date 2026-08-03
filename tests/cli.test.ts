@@ -155,8 +155,8 @@ test("browser prune reports kept running tabs and how to force them closed", asy
   const { endpoint, server } = await startControlServer(() => ({
     maxTabs: 5,
     closed: [
-      { id: "tab-1", ordinal: 1, label: "Task 1", status: "ready", traceId: "trace_one" },
-      { id: "tab-3", ordinal: 3, label: "Task 3", status: "error", traceId: "trace_three" },
+      { id: "tab-1", ordinal: 1, label: "Task 1", status: "ready", traceId: "trace_one", turnAborted: false },
+      { id: "tab-3", ordinal: 3, label: "Task 3", status: "error", traceId: "trace_three", turnAborted: false },
     ],
     skipped: [{ id: "tab-2", ordinal: 2, label: "Task 2", status: "running", traceId: "trace_two" }],
   }), received);
@@ -180,6 +180,70 @@ test("browser prune reports kept running tabs and how to force them closed", asy
     expect(lines.at(-1)).toBe(
       "Pass --force to prune every tab including running ones; that aborts those turns.",
     );
+  } finally {
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("browser close reports a forced abort independently of tab status", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-cli-close-abort-"));
+  const received: { url?: string; body?: unknown }[] = [];
+  const { endpoint, server } = await startControlServer(() => ({
+    closed: {
+      id: "tab-error",
+      ordinal: 2,
+      label: "Task 2",
+      status: "error",
+      traceId: "trace_error",
+      turnAborted: true,
+    },
+  }), received);
+  try {
+    const appHome = launcherHome(root, endpoint);
+    const result = await runCli(["browser", "close", "tab-error", "--force"], {
+      ...process.env,
+      CODEX_HOME: join(root, "codex"),
+      CODEX_CHATGPT_WEB_HOME: appHome,
+    });
+    expect(result.stderr).toBe("");
+    expect(result.exitCode).toBe(0);
+    expect(received).toEqual([{ url: "/v1/tabs/close", body: { ref: "tab-error", force: true } }]);
+    expect(result.stdout).toBe(
+      "Closed ChatGPT Web browser tab #2 (error).\nIts ChatGPT turn trace_error was aborted.\n",
+    );
+  } finally {
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("browser force prune reports live error and aborted tabs as turn aborts", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-cli-prune-aborts-"));
+  const received: { url?: string; body?: unknown }[] = [];
+  const { endpoint, server } = await startControlServer(() => ({
+    maxTabs: 5,
+    closed: [
+      { id: "tab-error", ordinal: 1, label: "Task 1", status: "error", traceId: "trace_error", turnAborted: true },
+      { id: "tab-aborted", ordinal: 2, label: "Task 2", status: "aborted", traceId: "trace_aborted", turnAborted: true },
+    ],
+    skipped: [],
+  }), received);
+  try {
+    const appHome = launcherHome(root, endpoint);
+    const result = await runCli(["browser", "prune", "--force"], {
+      ...process.env,
+      CODEX_HOME: join(root, "codex"),
+      CODEX_CHATGPT_WEB_HOME: appHome,
+    });
+    expect(result.stderr).toBe("");
+    expect(result.exitCode).toBe(0);
+    expect(received).toEqual([{ url: "/v1/tabs/prune", body: { force: true } }]);
+    const lines = result.stdout.trimEnd().split("\n");
+    expect(lines[0]).toBe("Closed ChatGPT Web browser tabs:");
+    expect(lines[1]).toMatch(/^\s+#1\s+error\s+id=tab-error\s+trace=trace_error\s+\(turn aborted\)$/);
+    expect(lines[2]).toMatch(/^\s+#2\s+aborted\s+id=tab-aborted\s+trace=trace_aborted\s+\(turn aborted\)$/);
+    expect(lines).toHaveLength(3);
   } finally {
     await new Promise<void>(resolve => server.close(() => resolve()));
     rmSync(root, { recursive: true, force: true });

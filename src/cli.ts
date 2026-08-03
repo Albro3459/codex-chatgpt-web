@@ -274,7 +274,7 @@ async function browserCommand(args: string[]): Promise<void> {
     if (!ref) throw new Error("Browser close needs a tab: browser close <tab-number|tab-id> [--force]");
     const { closed } = await closeLauncherBrowserTab(launcherBrowserDescriptorPath("close"), ref, force);
     stdout.write(`Closed ChatGPT Web browser tab #${closed.ordinal} (${closed.status}).\n`);
-    if (closed.status === "running") {
+    if (closed.turnAborted) {
       stdout.write(`Its ChatGPT turn ${closed.traceId ?? "-"} was aborted.\n`);
     }
     return;
@@ -291,7 +291,7 @@ async function browserCommand(args: string[]): Promise<void> {
     if (result.closed.length > 0) {
       stdout.write("Closed ChatGPT Web browser tabs:\n");
       for (const tab of result.closed) {
-        stdout.write(`${formatBrowserTabLine(tab, statusWidth, tab.status === "running" ? "  (turn aborted)" : "")}\n`);
+        stdout.write(`${formatBrowserTabLine(tab, statusWidth, tab.turnAborted ? "  (turn aborted)" : "")}\n`);
       }
     }
     if (result.skipped.length > 0) {

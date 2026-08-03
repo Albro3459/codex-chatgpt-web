@@ -84,7 +84,7 @@ test("browser control server authenticates and validates tab management requests
       if (args[0] === "tab-running") {
         throw new Error("ChatGPT Web browser tab 2 is still running turn abcdef123456; pass --force to close it and abort that turn");
       }
-      return { closed: { id: "tab-1", ordinal: 1, label: "Task 1", status: "ready", traceId: "abcdef123456" } };
+      return { closed: { id: "tab-1", ordinal: 1, label: "Task 1", status: "ready", traceId: "abcdef123456", turnAborted: false } };
     },
     pruneTurnTabs: (...args) => {
       calls.push(["prune", ...args]);
@@ -124,7 +124,14 @@ test("browser control server authenticates and validates tab management requests
 
     const close = await post("/v1/tabs/close", { ref: 1, force: true });
     assert.equal(close.status, 200);
-    assert.deepEqual((await close.json()).closed.id, "tab-1");
+    assert.deepEqual((await close.json()).closed, {
+      id: "tab-1",
+      ordinal: 1,
+      label: "Task 1",
+      status: "ready",
+      traceId: "abcdef123456",
+      turnAborted: false,
+    });
 
     const refused = await post("/v1/tabs/close", { ref: "tab-running" });
     assert.equal(refused.status, 400);
