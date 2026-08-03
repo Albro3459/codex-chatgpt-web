@@ -11,6 +11,7 @@ const {
 const {
   browserViewVisible,
   constrainBrowserBounds,
+  evictableTurnTabId,
   navigateBrowser,
   readBrowserNavigationState,
 } = require("./browser-state.cjs");
@@ -193,9 +194,13 @@ class BrowserHost {
 
   createTurnTab(traceId, helperPid) {
     if (this.turnTabs.size >= MAX_BROWSER_TABS) {
-      throw new Error(
-        `ChatGPT Web already has ${MAX_BROWSER_TABS} browser tabs; close one before starting another turn to avoid excessive parallel traffic on the ChatGPT account`,
-      );
+      const evictedId = evictableTurnTabId(this.turnTabs);
+      if (!evictedId) {
+        throw new Error(
+          `ChatGPT Web already has ${MAX_BROWSER_TABS} browser tabs running a turn. Close one or wait for one to finish before starting another turn to avoid excessive parallel traffic on the ChatGPT account.`,
+        );
+      }
+      this.closeTab(evictedId);
     }
     const id = randomBytes(12).toString("base64url");
     const surfaceId = randomBytes(24).toString("base64url");

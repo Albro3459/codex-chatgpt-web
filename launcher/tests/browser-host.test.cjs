@@ -5,6 +5,7 @@ const path = require("node:path");
 const {
   browserViewVisible,
   constrainBrowserBounds,
+  evictableTurnTabId,
   navigateBrowser,
   readBrowserNavigationState,
 } = require("../electron/browser-state.cjs");
@@ -840,16 +841,48 @@ test("a later provider round reuses its task tab and restores active ownership",
   assert.deepEqual(events, ["visible", "published", "descriptor", "browser.tab_reused"]);
 });
 
-test("five browser tabs are a hard account-safety limit", () => {
+test("five running browser tabs are a hard account-safety limit", () => {
   const turnTabs = new Map(Array.from({ length: 5 }, (_unused, index) => [
     `tab-${index + 1}`,
-    { ordinal: index + 1 },
+    { ordinal: index + 1, status: "running" },
   ]));
 
   assert.throws(
     () => BrowserHost.prototype.createTurnTab.call({ turnTabs }, "trace_six", 444),
-    /already has 5 browser tabs.*avoid excessive parallel traffic/,
+    /already has 5 browser tabs running a turn\. Close one or wait for one to finish.*avoid excessive parallel traffic/,
   );
+});
+
+test("a new browser turn at the tab limit evicts the oldest finished tab", () => {
+  const statuses = ["running", "ready", "running", "error", "running"];
+  const turnTabs = new Map(statuses.map((status, index) => [
+    `tab-${index + 1}`,
+    { ordinal: index + 1, status },
+  ]));
+  const closed = [];
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    turnTabs,
+    closeTab: (tabId) => {
+      closed.push(tabId);
+      turnTabs.delete(tabId);
+    },
+  });
+
+  // WebContentsView is unavailable outside Electron, so creation fails right after the eviction.
+  assert.throws(
+    () => BrowserHost.prototype.createTurnTab.call(fixture, "trace_six", 444),
+    TypeError,
+  );
+  assert.deepEqual(closed, ["tab-2"]);
+});
+
+test("the oldest non-running browser tab is the evictable one", () => {
+  const tabs = (statuses) => new Map(statuses.map((status, index) => [`tab-${index + 1}`, { status }]));
+
+  assert.equal(evictableTurnTabId(new Map()), null);
+  assert.equal(evictableTurnTabId(tabs(["running", "running", "running"])), null);
+  assert.equal(evictableTurnTabId(tabs(["running", "ready", "error", "running"])), "tab-2");
+  assert.equal(evictableTurnTabId(tabs(["ready", "aborted", "error"])), "tab-1");
 });
 
 test("ending one browser turn does not stop another running tab", async () => {

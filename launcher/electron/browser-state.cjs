@@ -41,9 +41,17 @@ function navigateBrowser(contents, action) {
   }
 }
 
+function evictableTurnTabId(turnTabs) {
+  for (const [id, tab] of turnTabs) {
+    if (tab.status !== "running") return id;
+  }
+  return null;
+}
+
 module.exports = {
   browserViewVisible,
   constrainBrowserBounds,
+  evictableTurnTabId,
   navigateBrowser,
   readBrowserNavigationState,
 };
