@@ -8,6 +8,7 @@ const {
   evictableTurnTabId,
   navigateBrowser,
   readBrowserNavigationState,
+  resolveTurnTabId,
 } = require("../electron/browser-state.cjs");
 const {
   allowedAuthUrl,
@@ -883,6 +884,123 @@ test("the oldest non-running browser tab is the evictable one", () => {
   assert.equal(evictableTurnTabId(tabs(["running", "running", "running"])), null);
   assert.equal(evictableTurnTabId(tabs(["running", "ready", "error", "running"])), "tab-2");
   assert.equal(evictableTurnTabId(tabs(["ready", "aborted", "error"])), "tab-1");
+});
+
+function createTurnTabHost(tabs, selectedTabId) {
+  const turnTabs = new Map(tabs.map((tab) => [tab.id, { ...tab }]));
+  const closed = [];
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    turnTabs,
+    selectedTabId: selectedTabId ?? "home",
+    closeTab: (tabId) => {
+      const tab = turnTabs.get(tabId);
+      if (!tab) throw new Error("Browser tab does not exist");
+      closed.push(tabId);
+      turnTabs.delete(tabId);
+      // closeTab rewrites a running tab before returning; reported entries must predate that.
+      if (tab.status === "running") tab.status = "aborted";
+    },
+  });
+  return { closed, fixture, turnTabs };
+}
+
+test("browser tab references resolve by 1-based ordinal or exact tab id", () => {
+  const turnTabs = new Map([
+    ["tab-alpha", { ordinal: 1 }],
+    ["tab-beta", { ordinal: 3 }],
+  ]);
+
+  assert.equal(resolveTurnTabId(turnTabs, 3), "tab-beta");
+  assert.equal(resolveTurnTabId(turnTabs, "3"), "tab-beta");
+  assert.equal(resolveTurnTabId(turnTabs, "tab-alpha"), "tab-alpha");
+  assert.equal(resolveTurnTabId(turnTabs, 2), null);
+  assert.equal(resolveTurnTabId(turnTabs, "0"), null);
+  assert.equal(resolveTurnTabId(turnTabs, "01"), null);
+  assert.equal(resolveTurnTabId(turnTabs, "tab-missing"), null);
+  assert.equal(resolveTurnTabId(turnTabs, null), null);
+  assert.equal(resolveTurnTabId(turnTabs, { ordinal: 1 }), null);
+});
+
+test("browser tab listing reports every tab in creation order with its ordinal and active flag", () => {
+  const { fixture } = createTurnTabHost([
+    { id: "tab-1", ordinal: 1, label: "Task 1", status: "running", traceId: "trace_one" },
+    { id: "tab-2", ordinal: 2, label: "Task 2", status: "ready", traceId: "trace_two" },
+  ], "tab-2");
+
+  const described = BrowserHost.prototype.describeTurnTabs.call(fixture);
+
+  assert.equal(described.maxTabs, 5);
+  assert.equal(described.activeTabId, "tab-2");
+  assert.deepEqual(described.tabs, [
+    { id: "tab-1", ordinal: 1, label: "Task 1", status: "running", traceId: "trace_one", active: false },
+    { id: "tab-2", ordinal: 2, label: "Task 2", status: "ready", traceId: "trace_two", active: true },
+  ]);
+});
+
+test("closing a browser tab by reference reports the status it had before the close", () => {
+  const tabs = [
+    { id: "tab-1", ordinal: 1, label: "Task 1", status: "running", traceId: "trace_one" },
+    { id: "tab-2", ordinal: 2, label: "Task 2", status: "ready", traceId: "trace_two" },
+  ];
+
+  const finished = createTurnTabHost(tabs);
+  assert.deepEqual(
+    BrowserHost.prototype.closeTurnTabByRef.call(finished.fixture, "2", false),
+    { closed: { id: "tab-2", ordinal: 2, label: "Task 2", status: "ready", traceId: "trace_two" } },
+  );
+  assert.deepEqual(finished.closed, ["tab-2"]);
+
+  const forced = createTurnTabHost(tabs);
+  assert.deepEqual(
+    BrowserHost.prototype.closeTurnTabByRef.call(forced.fixture, "tab-1", true),
+    { closed: { id: "tab-1", ordinal: 1, label: "Task 1", status: "running", traceId: "trace_one" } },
+  );
+  assert.deepEqual(forced.closed, ["tab-1"]);
+});
+
+test("closing a browser tab fails closed on an unknown reference or an unforced running turn", () => {
+  const { closed, fixture } = createTurnTabHost([
+    { id: "tab-1", ordinal: 1, label: "Task 1", status: "running", traceId: "trace_one" },
+  ]);
+
+  assert.throws(
+    () => BrowserHost.prototype.closeTurnTabByRef.call(fixture, "9", false),
+    /No ChatGPT Web browser tab matches '9'.*browser tabs/,
+  );
+  assert.throws(
+    () => BrowserHost.prototype.closeTurnTabByRef.call(fixture, 1, false),
+    /tab 1 is still running turn trace_one; pass --force/,
+  );
+  assert.deepEqual(closed, []);
+});
+
+test("pruning browser tabs keeps running turns unless they are forced", () => {
+  const tabs = [
+    { id: "tab-1", ordinal: 1, label: "Task 1", status: "ready", traceId: "trace_one" },
+    { id: "tab-2", ordinal: 2, label: "Task 2", status: "running", traceId: "trace_two" },
+    { id: "tab-3", ordinal: 3, label: "Task 3", status: "error", traceId: "trace_three" },
+  ];
+
+  const kept = createTurnTabHost(tabs);
+  const pruned = BrowserHost.prototype.pruneTurnTabs.call(kept.fixture, false);
+  assert.equal(pruned.maxTabs, 5);
+  assert.deepEqual(pruned.closed.map((tab) => tab.id), ["tab-1", "tab-3"]);
+  assert.deepEqual(pruned.skipped, [
+    { id: "tab-2", ordinal: 2, label: "Task 2", status: "running", traceId: "trace_two" },
+  ]);
+  assert.deepEqual(kept.closed, ["tab-1", "tab-3"]);
+  assert.deepEqual([...kept.turnTabs.keys()], ["tab-2"]);
+
+  const forced = createTurnTabHost(tabs);
+  const all = BrowserHost.prototype.pruneTurnTabs.call(forced.fixture, true);
+  assert.deepEqual(all.skipped, []);
+  assert.deepEqual(all.closed.map((tab) => [tab.ordinal, tab.status]), [
+    [1, "ready"],
+    [2, "running"],
+    [3, "error"],
+  ]);
+  assert.deepEqual(forced.closed, ["tab-1", "tab-2", "tab-3"]);
+  assert.equal(forced.turnTabs.size, 0);
 });
 
 test("ending one browser turn does not stop another running tab", async () => {

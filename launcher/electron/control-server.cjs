@@ -24,6 +24,23 @@ async function readJson(request) {
   return JSON.parse(text);
 }
 
+function readForceFlag(body) {
+  const force = body && typeof body === "object" ? body.force : undefined;
+  if (force !== undefined && typeof force !== "boolean") throw new Error("tab force flag is invalid");
+  return force === true;
+}
+
+function handleTabsRequest(host, url, body) {
+  if (url === "/v1/tabs/list") return host.describeTurnTabs();
+  if (url === "/v1/tabs/prune") return host.pruneTurnTabs(readForceFlag(body));
+  const ref = body && typeof body === "object" ? body.ref : undefined;
+  const validRef = typeof ref === "string"
+    ? /^[A-Za-z0-9_-]{1,64}$/.test(ref)
+    : Number.isSafeInteger(ref) && ref > 0;
+  if (!validRef) throw new Error("tab reference is invalid");
+  return host.closeTurnTabByRef(ref, readForceFlag(body));
+}
+
 function writeJson(response, status, body) {
   const encoded = Buffer.from(`${JSON.stringify(body)}\n`);
   response.writeHead(status, {
@@ -92,7 +109,10 @@ class BrowserControlServer {
     }
     const isTurn = request.url === "/v1/turn/start" || request.url === "/v1/turn/end";
     const isSessionInspect = request.url === "/v1/session/inspect";
-    if (request.method !== "POST" || (!isTurn && !isSessionInspect)) {
+    const isTabs = request.url === "/v1/tabs/list"
+      || request.url === "/v1/tabs/close"
+      || request.url === "/v1/tabs/prune";
+    if (request.method !== "POST" || (!isTurn && !isSessionInspect && !isTabs)) {
       writeJson(response, 404, { error: "not_found" });
       return;
     }
@@ -103,6 +123,10 @@ class BrowserControlServer {
       if (isSessionInspect) {
         const result = await host.inspectSession(body?.detectPro === true);
         writeJson(response, 200, result);
+        return;
+      }
+      if (isTabs) {
+        writeJson(response, 200, handleTabsRequest(host, request.url, body));
         return;
       }
       if (!body || typeof body !== "object" || !/^[A-Za-z0-9_-]{6,128}$/.test(body.traceId || "")) {

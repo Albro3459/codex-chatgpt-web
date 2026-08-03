@@ -48,10 +48,24 @@ function evictableTurnTabId(turnTabs) {
   return null;
 }
 
+function resolveTurnTabId(turnTabs, ref) {
+  if (typeof ref !== "string" && typeof ref !== "number") return null;
+  const text = String(ref);
+  if (/^[1-9][0-9]*$/.test(text)) {
+    const ordinal = Number(text);
+    for (const [id, tab] of turnTabs) {
+      if (tab.ordinal === ordinal) return id;
+    }
+    return null;
+  }
+  return turnTabs.has(text) ? text : null;
+}
+
 module.exports = {
   browserViewVisible,
   constrainBrowserBounds,
   evictableTurnTabId,
   navigateBrowser,
   readBrowserNavigationState,
+  resolveTurnTabId,
 };

@@ -71,3 +71,76 @@ test("browser control server authenticates and owns turn visibility", async () =
     await server.close();
   }
 });
+
+test("browser control server authenticates and validates tab management requests", async () => {
+  const calls = [];
+  const host = {
+    describeTurnTabs: () => {
+      calls.push(["list"]);
+      return { maxTabs: 5, activeTabId: "tab-1", tabs: [] };
+    },
+    closeTurnTabByRef: (...args) => {
+      calls.push(["close", ...args]);
+      if (args[0] === "tab-running") {
+        throw new Error("ChatGPT Web browser tab 2 is still running turn abcdef123456; pass --force to close it and abort that turn");
+      }
+      return { closed: { id: "tab-1", ordinal: 1, label: "Task 1", status: "ready", traceId: "abcdef123456" } };
+    },
+    pruneTurnTabs: (...args) => {
+      calls.push(["prune", ...args]);
+      return { maxTabs: 5, closed: [], skipped: [] };
+    },
+  };
+  const server = await new BrowserControlServer({
+    logger: { info() {}, warn() {}, error() {} },
+    getBrowserHost: () => host,
+    getPreferences: () => ({ showBrowserDuringTurns: true }),
+  }).start();
+  const descriptor = server.descriptor();
+  const post = (route, body, headers = { authorization: `Bearer ${descriptor.token}` }) => fetch(
+    `${descriptor.endpoint}${route}`,
+    { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify(body) },
+  );
+  try {
+    const unauthenticated = await post("/v1/tabs/list", {}, {});
+    assert.equal(unauthenticated.status, 401);
+
+    const wrongMethod = await fetch(`${descriptor.endpoint}/v1/tabs/list`, {
+      method: "GET",
+      headers: { authorization: `Bearer ${descriptor.token}` },
+    });
+    assert.equal(wrongMethod.status, 404);
+
+    const list = await post("/v1/tabs/list", {});
+    assert.equal(list.status, 200);
+    assert.deepEqual(await list.json(), { maxTabs: 5, activeTabId: "tab-1", tabs: [] });
+
+    const invalidRef = await post("/v1/tabs/close", { ref: "tab one" });
+    assert.equal(invalidRef.status, 400);
+    assert.deepEqual(await invalidRef.json(), { error: "tab reference is invalid" });
+    assert.equal((await post("/v1/tabs/close", { ref: 0 })).status, 400);
+    assert.equal((await post("/v1/tabs/close", { ref: 1, force: "yes" })).status, 400);
+    assert.equal((await post("/v1/tabs/prune", { force: 1 })).status, 400);
+
+    const close = await post("/v1/tabs/close", { ref: 1, force: true });
+    assert.equal(close.status, 200);
+    assert.deepEqual((await close.json()).closed.id, "tab-1");
+
+    const refused = await post("/v1/tabs/close", { ref: "tab-running" });
+    assert.equal(refused.status, 400);
+    assert.match((await refused.json()).error, /still running turn abcdef123456; pass --force/);
+
+    const prune = await post("/v1/tabs/prune", {});
+    assert.equal(prune.status, 200);
+    assert.deepEqual(await prune.json(), { maxTabs: 5, closed: [], skipped: [] });
+
+    assert.deepEqual(calls, [
+      ["list"],
+      ["close", 1, true],
+      ["close", "tab-running", false],
+      ["prune", false],
+    ]);
+  } finally {
+    await server.close();
+  }
+});

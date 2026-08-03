@@ -14,6 +14,7 @@ const {
   evictableTurnTabId,
   navigateBrowser,
   readBrowserNavigationState,
+  resolveTurnTabId,
 } = require("./browser-state.cjs");
 
 const TEMPORARY_CHAT_URL = "https://chatgpt.com/?temporary-chat=true";
@@ -481,6 +482,66 @@ class BrowserHost {
     this.writeDescriptor();
     this.logger.info("browser.tab_closed", { tabId, traceId: tab.traceId, status: tab.status });
     return this.snapshot();
+  }
+
+  describeTurnTabs() {
+    return {
+      maxTabs: MAX_BROWSER_TABS,
+      activeTabId: this.selectedTabId,
+      tabs: [...this.turnTabs.values()].map((tab) => ({
+        id: tab.id,
+        ordinal: tab.ordinal,
+        label: tab.label,
+        status: tab.status,
+        traceId: tab.traceId,
+        active: this.selectedTabId === tab.id,
+      })),
+    };
+  }
+
+  closeTurnTabByRef(ref, force) {
+    const tabId = resolveTurnTabId(this.turnTabs, ref);
+    if (!tabId) {
+      throw new Error(
+        `No ChatGPT Web browser tab matches '${ref}'; run 'codex-chatgpt-web browser tabs' to list them`,
+      );
+    }
+    const tab = this.turnTabs.get(tabId);
+    if (tab.status === "running" && force !== true) {
+      throw new Error(
+        `ChatGPT Web browser tab ${tab.ordinal} is still running turn ${tab.traceId}; pass --force to close it and abort that turn`,
+      );
+    }
+    const closed = {
+      id: tab.id,
+      ordinal: tab.ordinal,
+      label: tab.label,
+      status: tab.status,
+      traceId: tab.traceId,
+    };
+    this.closeTab(tab.id);
+    return { closed };
+  }
+
+  pruneTurnTabs(force) {
+    const closed = [];
+    const skipped = [];
+    for (const tab of [...this.turnTabs.values()]) {
+      const entry = {
+        id: tab.id,
+        ordinal: tab.ordinal,
+        label: tab.label,
+        status: tab.status,
+        traceId: tab.traceId,
+      };
+      if (force !== true && tab.status === "running") {
+        skipped.push(entry);
+        continue;
+      }
+      closed.push(entry);
+      this.closeTab(tab.id);
+    }
+    return { maxTabs: MAX_BROWSER_TABS, closed, skipped };
   }
 
   createAuthView(options = {}) {

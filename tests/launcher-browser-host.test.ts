@@ -4,11 +4,15 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  LAUNCHER_TABS_TIMEOUT_MS,
   LAUNCHER_TURN_END_TIMEOUT_MS,
   LAUNCHER_TURN_START_TIMEOUT_MS,
   LAUNCHER_BROWSER_HOST_KIND,
+  closeLauncherBrowserTab,
   inspectLauncherBrowserHost,
+  listLauncherBrowserTabs,
   notifyLauncherTurn,
+  pruneLauncherBrowserTabs,
   readLauncherBrowserHostDescriptor,
   selectLauncherPage,
 } from "../src/launcher-browser-host";
@@ -134,6 +138,128 @@ test("launcher session verification uses the authenticated control channel inste
       proAvailable: true,
       url: "https://chatgpt.com/?temporary-chat=true",
     });
+  } finally {
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test("launcher tab control lists, closes, and prunes over the authenticated channel", async () => {
+  expect(LAUNCHER_TABS_TIMEOUT_MS).toBe(5_000);
+  const received: { url?: string; authorization?: string; body?: unknown }[] = [];
+  const server = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    received.push({
+      url: request.url,
+      authorization: request.headers.authorization,
+      body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
+    });
+    response.writeHead(200, { "content-type": "application/json" });
+    if (request.url === "/v1/tabs/list") {
+      response.end(JSON.stringify({
+        maxTabs: 5,
+        activeTabId: "tab-2",
+        tabs: [
+          { id: "tab-1", ordinal: 1, label: "Task 1", status: "running", traceId: "trace_one", active: false },
+          { id: "tab-2", ordinal: 2, label: "Task 2", status: "ready", traceId: null, active: true },
+        ],
+      }));
+      return;
+    }
+    if (request.url === "/v1/tabs/close") {
+      response.end(JSON.stringify({
+        closed: { id: "tab-1", ordinal: 1, label: "Task 1", status: "running", traceId: "trace_one" },
+      }));
+      return;
+    }
+    response.end(JSON.stringify({
+      maxTabs: 5,
+      closed: [{ id: "tab-2", ordinal: 2, label: "Task 2", status: "ready", traceId: null }],
+      skipped: [{ id: "tab-1", ordinal: 1, label: "Task 1", status: "running", traceId: "trace_one" }],
+    }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("test server has no port");
+    const path = descriptorFile(`http://127.0.0.1:${address.port}`);
+
+    expect(await listLauncherBrowserTabs(path)).toEqual({
+      maxTabs: 5,
+      activeTabId: "tab-2",
+      tabs: [
+        { id: "tab-1", ordinal: 1, label: "Task 1", status: "running", traceId: "trace_one", active: false },
+        { id: "tab-2", ordinal: 2, label: "Task 2", status: "ready", traceId: null, active: true },
+      ],
+    });
+    expect(await closeLauncherBrowserTab(path, "1", true)).toEqual({
+      closed: { id: "tab-1", ordinal: 1, label: "Task 1", status: "running", traceId: "trace_one" },
+    });
+    expect(await pruneLauncherBrowserTabs(path, false)).toEqual({
+      maxTabs: 5,
+      closed: [{ id: "tab-2", ordinal: 2, label: "Task 2", status: "ready", traceId: null }],
+      skipped: [{ id: "tab-1", ordinal: 1, label: "Task 1", status: "running", traceId: "trace_one" }],
+    });
+
+    expect(received.map(entry => entry.url)).toEqual(["/v1/tabs/list", "/v1/tabs/close", "/v1/tabs/prune"]);
+    for (const entry of received) {
+      expect(entry.authorization).toBe("Bearer launcher-control-token-0123456789abcdefghijklmnop");
+    }
+    expect(received.map(entry => entry.body)).toEqual([{}, { ref: "1", force: true }, { force: false }]);
+  } finally {
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test("launcher tab control surfaces the launcher refusal to close a running turn", async () => {
+  const server = createServer(async (request, response) => {
+    for await (const chunk of request) void chunk;
+    response.writeHead(400, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      error: "ChatGPT Web browser tab 2 is still running turn abc123def456; pass --force to close it and abort that turn",
+    }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("test server has no port");
+    const path = descriptorFile(`http://127.0.0.1:${address.port}`);
+    await expect(closeLauncherBrowserTab(path, "2", false)).rejects.toThrow(
+      "Launcher browser control channel failed: ChatGPT Web browser tab 2 is still running turn abc123def456; pass --force to close it and abort that turn",
+    );
+  } finally {
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test("launcher tab control rejects malformed tab payloads", async () => {
+  const server = createServer(async (request, response) => {
+    for await (const chunk of request) void chunk;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(request.url === "/v1/tabs/list"
+      ? JSON.stringify({ maxTabs: 5, activeTabId: "tab-1", tabs: "tab-1" })
+      : JSON.stringify({ closed: { id: "tab-1", ordinal: 1, label: "Task 1" } }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("test server has no port");
+    const path = descriptorFile(`http://127.0.0.1:${address.port}`);
+    await expect(listLauncherBrowserTabs(path)).rejects.toThrow(
+      "Launcher browser control channel failed: Launcher returned an invalid browser tab list",
+    );
+    await expect(closeLauncherBrowserTab(path, "1", false)).rejects.toThrow(
+      "Launcher browser control channel failed: Launcher returned an invalid browser tab entry",
+    );
   } finally {
     await new Promise<void>(resolve => server.close(() => resolve()));
   }

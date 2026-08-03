@@ -6,7 +6,14 @@ import { existsSync, rmSync } from "node:fs";
 import { stdin, stdout } from "node:process";
 import { checkBrowserEngine, loginToChatGpt } from "./browser-login";
 import { getConfigDir, getConfigPath, loadConfig, loadConfigForSetup } from "./config";
-import { inspectLauncherBrowserHost, readLauncherBrowserHostDescriptor } from "./launcher-browser-host";
+import {
+  closeLauncherBrowserTab,
+  inspectLauncherBrowserHost,
+  listLauncherBrowserTabs,
+  pruneLauncherBrowserTabs,
+  readLauncherBrowserHostDescriptor,
+  type LauncherBrowserTabEntry,
+} from "./launcher-browser-host";
 import {
   activateCodexIntegration,
   deactivateCodexIntegration,
@@ -33,7 +40,8 @@ Usage:
   codex-chatgpt-web login
   codex-chatgpt-web doctor [--json]
   codex-chatgpt-web route <status|connect|disconnect>
-  codex-chatgpt-web browser check
+  codex-chatgpt-web browser <check|tabs|prune> [options]
+  codex-chatgpt-web browser close <tab-number|tab-id> [--force]
   codex-chatgpt-web serve
   codex-chatgpt-web mcp [--broker-socket PATH]
   codex-chatgpt-web service <status|install|start|restart|stop|cancel-turns>
@@ -56,6 +64,10 @@ Setup options:
   --login                      Refresh the stored ChatGPT login even if one exists
   --auto-approve-tool-calls    Opt in to per-call browser clicks on "Allow once" prompts
   --acknowledge-unofficial     Accept the one-time unofficial-browser-automation notice
+
+Browser options:
+  --json                       Print the browser tab list as structured JSON
+  --force                      Close tabs that are still running a turn, aborting those turns
 
 Global:
   --home PATH                  Override ~/.codex-chatgpt-web
@@ -207,6 +219,97 @@ async function routeCommand(args: string[]): Promise<void> {
   stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 }
 
+function launcherBrowserDescriptorPath(action: string): string {
+  const config = loadConfig();
+  if (config.browserHost !== "launcher") {
+    throw new Error(
+      `ChatGPT Web browser tabs are owned by the launcher; browser ${action} needs a launcher-managed browser host`,
+    );
+  }
+  return config.browserHostDescriptorPath!;
+}
+
+function formatBrowserTabLine(tab: LauncherBrowserTabEntry, statusWidth: number, suffix = ""): string {
+  return `  #${tab.ordinal}  ${tab.status.padEnd(statusWidth)}  id=${tab.id}  trace=${tab.traceId ?? "-"}${suffix}`;
+}
+
+async function browserCommand(args: string[]): Promise<void> {
+  const action = args.shift();
+  if (action === "check") {
+    assertNoArgs(args);
+    const config = loadConfig();
+    if (config.browserHost === "launcher") {
+      await inspectLauncherBrowserHost(config.browserHostDescriptorPath!);
+      stdout.write("Playwright can reach the authenticated ChatGPT surface embedded in the launcher.\n");
+    } else {
+      await checkBrowserEngine(config);
+      stdout.write("Playwright can launch the configured Chrome executable.\n");
+    }
+    return;
+  }
+  if (action === "tabs") {
+    const json = takeFlag(args, "--json");
+    assertNoArgs(args);
+    const result = await listLauncherBrowserTabs(launcherBrowserDescriptorPath("tabs"));
+    if (json) {
+      stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+      return;
+    }
+    if (result.tabs.length === 0) {
+      stdout.write(`No ChatGPT Web browser tabs are open (0/${result.maxTabs}).\n`);
+      return;
+    }
+    const statusWidth = Math.max(...result.tabs.map(tab => tab.status.length));
+    stdout.write(`ChatGPT Web browser tabs (${result.tabs.length}/${result.maxTabs}), in launcher tab order:\n`);
+    for (const tab of result.tabs) {
+      stdout.write(`${formatBrowserTabLine(tab, statusWidth, tab.active ? "  (active)" : "")}\n`);
+    }
+    stdout.write("Pass the # number or the id to: codex-chatgpt-web browser close <tab-number|tab-id>\n");
+    return;
+  }
+  if (action === "close") {
+    const force = takeFlag(args, "--force");
+    const ref = args.shift();
+    assertNoArgs(args);
+    if (!ref) throw new Error("Browser close needs a tab: browser close <tab-number|tab-id> [--force]");
+    const { closed } = await closeLauncherBrowserTab(launcherBrowserDescriptorPath("close"), ref, force);
+    stdout.write(`Closed ChatGPT Web browser tab #${closed.ordinal} (${closed.status}).\n`);
+    if (closed.status === "running") {
+      stdout.write(`Its ChatGPT turn ${closed.traceId ?? "-"} was aborted.\n`);
+    }
+    return;
+  }
+  if (action === "prune") {
+    const force = takeFlag(args, "--force");
+    assertNoArgs(args);
+    const result = await pruneLauncherBrowserTabs(launcherBrowserDescriptorPath("prune"), force);
+    if (result.closed.length === 0 && result.skipped.length === 0) {
+      stdout.write("No ChatGPT Web browser tabs needed cleaning up.\n");
+      return;
+    }
+    const statusWidth = Math.max(...[...result.closed, ...result.skipped].map(tab => tab.status.length));
+    if (result.closed.length > 0) {
+      stdout.write("Closed ChatGPT Web browser tabs:\n");
+      for (const tab of result.closed) {
+        stdout.write(`${formatBrowserTabLine(tab, statusWidth, tab.status === "running" ? "  (turn aborted)" : "")}\n`);
+      }
+    }
+    if (result.skipped.length > 0) {
+      stdout.write("Kept running ChatGPT Web browser tabs:\n");
+      for (const tab of result.skipped) {
+        stdout.write(`${formatBrowserTabLine(tab, statusWidth)}\n`);
+      }
+      if (!force) {
+        stdout.write("Pass --force to prune every tab including running ones; that aborts those turns.\n");
+      }
+    }
+    return;
+  }
+  throw new Error(
+    "Browser command must be one of: browser check, browser tabs, browser close <tab-number|tab-id>, browser prune",
+  );
+}
+
 async function serviceCommand(args: string[]): Promise<void> {
   const action = args.shift() ?? "status";
   assertNoArgs(args);
@@ -341,19 +444,8 @@ async function main(): Promise<void> {
     stdout.write(`ChatGPT login stored at ${result.storageStatePath}\n`);
   } else if (command === "doctor" || command === "status") await doctorCommand(args);
   else if (command === "route") await routeCommand(args);
-  else if (command === "browser") {
-    const action = args.shift();
-    assertNoArgs(args);
-    if (action !== "check") throw new Error("Browser command must be: browser check");
-    const config = loadConfig();
-    if (config.browserHost === "launcher") {
-      await inspectLauncherBrowserHost(config.browserHostDescriptorPath!);
-      stdout.write("Playwright can reach the authenticated ChatGPT surface embedded in the launcher.\n");
-    } else {
-      await checkBrowserEngine(config);
-      stdout.write("Playwright can launch the configured Chrome executable.\n");
-    }
-  } else if (command === "serve") {
+  else if (command === "browser") await browserCommand(args);
+  else if (command === "serve") {
     assertNoArgs(args);
     const config = loadConfig();
     const server = startServer(config);

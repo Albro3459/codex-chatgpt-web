@@ -247,6 +247,136 @@ export async function inspectLauncherBrowserHost(
   }
 }
 
+export interface LauncherBrowserTab {
+  id: string;
+  ordinal: number;
+  label: string;
+  status: string;
+  traceId: string | null;
+  active: boolean;
+}
+
+export type LauncherBrowserTabEntry = Omit<LauncherBrowserTab, "active">;
+
+export interface LauncherBrowserTabList {
+  maxTabs: number;
+  activeTabId: string;
+  tabs: LauncherBrowserTab[];
+}
+
+export interface LauncherBrowserTabClosure {
+  closed: LauncherBrowserTabEntry;
+}
+
+export interface LauncherBrowserTabPrune {
+  maxTabs: number;
+  closed: LauncherBrowserTabEntry[];
+  skipped: LauncherBrowserTabEntry[];
+}
+
+export const LAUNCHER_TABS_TIMEOUT_MS = 5_000;
+
+async function requestLauncherTabs<T>(
+  descriptorPath: string,
+  route: string,
+  payload: Record<string, unknown>,
+  parse: (body: Record<string, unknown>) => T,
+): Promise<T> {
+  const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), LAUNCHER_TABS_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${descriptor.control.endpoint}${route}`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${descriptor.control.token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    const body = await response.json().catch(() => ({})) as Record<string, unknown>;
+    if (!response.ok) throw new Error(typeof body.error === "string" ? body.error : `HTTP ${response.status}`);
+    return parse(body);
+  } catch (error) {
+    throw new Error(`Launcher browser control channel failed: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function parseTabEntry(value: unknown): LauncherBrowserTabEntry {
+  const entry = value as Partial<LauncherBrowserTab> | null;
+  if (
+    !entry
+    || typeof entry !== "object"
+    || typeof entry.id !== "string"
+    || !Number.isInteger(entry.ordinal)
+    || typeof entry.label !== "string"
+    || typeof entry.status !== "string"
+    || (entry.traceId !== null && typeof entry.traceId !== "string")
+  ) {
+    throw new Error("Launcher returned an invalid browser tab entry");
+  }
+  return {
+    id: entry.id,
+    ordinal: entry.ordinal!,
+    label: entry.label,
+    status: entry.status,
+    traceId: entry.traceId!,
+  };
+}
+
+function parseTabEntries(value: unknown): LauncherBrowserTabEntry[] {
+  if (!Array.isArray(value)) throw new Error("Launcher returned an invalid browser tab list");
+  return value.map(entry => parseTabEntry(entry));
+}
+
+export async function listLauncherBrowserTabs(descriptorPath: string): Promise<LauncherBrowserTabList> {
+  return await requestLauncherTabs(descriptorPath, "/v1/tabs/list", {}, body => {
+    if (!Number.isInteger(body.maxTabs) || typeof body.activeTabId !== "string") {
+      throw new Error("Launcher returned an invalid browser tab list");
+    }
+    if (!Array.isArray(body.tabs)) throw new Error("Launcher returned an invalid browser tab list");
+    return {
+      maxTabs: body.maxTabs as number,
+      activeTabId: body.activeTabId,
+      tabs: body.tabs.map(entry => {
+        const active = (entry as { active?: unknown } | null)?.active;
+        if (typeof active !== "boolean") throw new Error("Launcher returned an invalid browser tab entry");
+        return { ...parseTabEntry(entry), active };
+      }),
+    };
+  });
+}
+
+export async function closeLauncherBrowserTab(
+  descriptorPath: string,
+  ref: string,
+  force: boolean,
+): Promise<LauncherBrowserTabClosure> {
+  return await requestLauncherTabs(
+    descriptorPath,
+    "/v1/tabs/close",
+    { ref, force },
+    body => ({ closed: parseTabEntry(body.closed) }),
+  );
+}
+
+export async function pruneLauncherBrowserTabs(
+  descriptorPath: string,
+  force: boolean,
+): Promise<LauncherBrowserTabPrune> {
+  return await requestLauncherTabs(descriptorPath, "/v1/tabs/prune", { force }, body => {
+    if (!Number.isInteger(body.maxTabs)) throw new Error("Launcher returned an invalid browser tab list");
+    return {
+      maxTabs: body.maxTabs as number,
+      closed: parseTabEntries(body.closed),
+      skipped: parseTabEntries(body.skipped),
+    };
+  });
+}
+
 export type LauncherTurnActivity =
   | { phase: "start"; traceId: string; helperPid: number }
   | {
