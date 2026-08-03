@@ -912,6 +912,51 @@ test("a later provider round reuses its task tab and restores active ownership",
   assert.deepEqual(events, ["visible", "published", "descriptor", "browser.tab_reused"]);
 });
 
+test("an unended error tab remains active ownership and blocks manual operations", async () => {
+  const tab = {
+    id: "tab-error-live",
+    traceId: "trace_error_live",
+    status: "error",
+    ended: false,
+  };
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    turnTabs: new Map([[tab.id, tab]]),
+    manualOperation: null,
+    activateHomeSurface() { assert.fail("manual operation must not activate home"); },
+  });
+
+  assert.equal(fixture.activeTraceId, tab.traceId);
+  await assert.rejects(
+    BrowserHost.prototype.withManualOperation.call(fixture, "session inspection", async () => {}),
+    /ChatGPT browser is running Codex turn trace_error_live/,
+  );
+  assert.equal(fixture.manualOperation, null);
+});
+
+test("a different helper cannot reuse an unended error tab", () => {
+  const tab = {
+    id: "tab-error-live",
+    surfaceId: "surface-error-live",
+    traceId: "trace_error_live",
+    helperPid: 111,
+    status: "error",
+    ended: false,
+    view: { webContents: { isDestroyed: () => false } },
+  };
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    turnTabs: new Map([[tab.id, tab]]),
+    manualOperation: null,
+  });
+
+  assert.throws(
+    () => BrowserHost.prototype.beginTurn.call(fixture, tab.traceId, false, 222),
+    /ChatGPT browser turn trace_error_live is owned by another helper process/,
+  );
+  assert.equal(tab.helperPid, 111);
+  assert.equal(tab.status, "error");
+  assert.equal(tab.ended, false);
+});
+
 test("unended error tabs are not evictable", () => {
   const turnTabs = new Map([
     ["tab-error", { status: "error", ended: false }],
@@ -1047,6 +1092,52 @@ test("successful creation evicts the oldest ended tab and reuses its ordinal", (
   assert.equal([...turnTabs.values()].at(-1), created);
 });
 
+test("synchronous replacement setup failure preserves the ended eviction candidate", () => {
+  const closedContents = [];
+  const replacement = createFakeBrowserView();
+  replacement.setBounds = () => { throw new Error("replacement bounds failed"); };
+  replacement.webContents.close = () => closedContents.push("replacement");
+  class FakeWebContentsView {
+    constructor() {
+      return replacement;
+    }
+  }
+  const { BrowserHost: FakeBrowserHost } = loadBrowserHostWithViewConstructor(FakeWebContentsView);
+  const candidate = {
+    id: "tab-2",
+    ordinal: 2,
+    status: "error",
+    ended: true,
+    view: createFakeBrowserView(),
+  };
+  const turnTabs = new Map([
+    ["tab-1", { id: "tab-1", ordinal: 1, status: "running", ended: false, view: createFakeBrowserView() }],
+    [candidate.id, candidate],
+    ["tab-3", { id: "tab-3", ordinal: 3, status: "running", ended: false, view: createFakeBrowserView() }],
+    ["tab-4", { id: "tab-4", ordinal: 4, status: "running", ended: false, view: createFakeBrowserView() }],
+    ["tab-5", { id: "tab-5", ordinal: 5, status: "running", ended: false, view: createFakeBrowserView() }],
+  ]);
+  const closed = [];
+  const fixture = Object.assign(Object.create(FakeBrowserHost.prototype), {
+    turnTabs,
+    bounds: { x: 0, y: 0, width: 800, height: 600 },
+    window: { contentView: { addChildView() {}, removeChildView() {} } },
+    closedTurnOwners: new Map(),
+    closeTab: (tabId) => {
+      closed.push(tabId);
+      turnTabs.delete(tabId);
+    },
+  });
+
+  assert.throws(
+    () => FakeBrowserHost.prototype.createTurnTab.call(fixture, "trace_six", 444),
+    /replacement bounds failed/,
+  );
+  assert.deepEqual(closed, []);
+  assert.equal(turnTabs.get(candidate.id), candidate);
+  assert.deepEqual(closedContents, ["replacement"]);
+});
+
 test("the oldest ended browser tab is the evictable one", () => {
   const tabs = (entries) => new Map(entries.map(([status, ended], index) => [
     `tab-${index + 1}`,
@@ -1118,8 +1209,8 @@ test("browser tab listing reports every tab in creation order with its ordinal a
 
 test("closing a browser tab by reference reports the status it had before the close", () => {
   const tabs = [
-    { id: "tab-1", ordinal: 1, label: "Task 1", status: "running", traceId: "trace_one" },
-    { id: "tab-2", ordinal: 2, label: "Task 2", status: "ready", traceId: "trace_two" },
+    { id: "tab-1", ordinal: 1, label: "Task 1", status: "running", ended: false, traceId: "trace_one" },
+    { id: "tab-2", ordinal: 2, label: "Task 2", status: "ready", ended: true, traceId: "trace_two" },
   ];
 
   const finished = createTurnTabHost(tabs);
@@ -1139,7 +1230,7 @@ test("closing a browser tab by reference reports the status it had before the cl
 
 test("closing a browser tab fails closed on an unknown reference or an unforced running turn", () => {
   const { closed, fixture } = createTurnTabHost([
-    { id: "tab-1", ordinal: 1, label: "Task 1", status: "running", traceId: "trace_one" },
+    { id: "tab-1", ordinal: 1, label: "Task 1", status: "running", ended: false, traceId: "trace_one" },
   ]);
 
   assert.throws(
@@ -1153,22 +1244,51 @@ test("closing a browser tab fails closed on an unknown reference or an unforced 
   assert.deepEqual(closed, []);
 });
 
-test("pruning browser tabs keeps running turns unless they are forced", () => {
+test("unforced close preserves unended error and aborted tabs while force closes them", () => {
   const tabs = [
-    { id: "tab-1", ordinal: 1, label: "Task 1", status: "ready", traceId: "trace_one" },
-    { id: "tab-2", ordinal: 2, label: "Task 2", status: "running", traceId: "trace_two" },
-    { id: "tab-3", ordinal: 3, label: "Task 3", status: "error", traceId: "trace_three" },
+    { id: "tab-error", ordinal: 1, label: "Error", status: "error", ended: false, traceId: "trace_error" },
+    { id: "tab-aborted", ordinal: 2, label: "Aborted", status: "aborted", ended: false, traceId: "trace_aborted" },
+  ];
+  const kept = createTurnTabHost(tabs);
+
+  assert.throws(
+    () => BrowserHost.prototype.closeTurnTabByRef.call(kept.fixture, "tab-error", false),
+    /tab 1 is still running turn trace_error; pass --force/,
+  );
+  assert.throws(
+    () => BrowserHost.prototype.closeTurnTabByRef.call(kept.fixture, "tab-aborted", false),
+    /tab 2 is still running turn trace_aborted; pass --force/,
+  );
+  assert.deepEqual(kept.closed, []);
+  assert.deepEqual([...kept.turnTabs.keys()], ["tab-error", "tab-aborted"]);
+
+  const forced = createTurnTabHost(tabs);
+  BrowserHost.prototype.closeTurnTabByRef.call(forced.fixture, "tab-error", true);
+  BrowserHost.prototype.closeTurnTabByRef.call(forced.fixture, "tab-aborted", true);
+  assert.deepEqual(forced.closed, ["tab-error", "tab-aborted"]);
+  assert.equal(forced.turnTabs.size, 0);
+});
+
+test("pruning browser tabs keeps unended turns unless they are forced", () => {
+  const tabs = [
+    { id: "tab-1", ordinal: 1, label: "Task 1", status: "ready", ended: true, traceId: "trace_one" },
+    { id: "tab-2", ordinal: 2, label: "Task 2", status: "running", ended: false, traceId: "trace_two" },
+    { id: "tab-3", ordinal: 3, label: "Task 3", status: "error", ended: false, traceId: "trace_three" },
+    { id: "tab-4", ordinal: 4, label: "Task 4", status: "aborted", ended: false, traceId: "trace_four" },
+    { id: "tab-5", ordinal: 5, label: "Task 5", status: "error", ended: true, traceId: "trace_five" },
   ];
 
   const kept = createTurnTabHost(tabs);
   const pruned = BrowserHost.prototype.pruneTurnTabs.call(kept.fixture, false);
   assert.equal(pruned.maxTabs, 5);
-  assert.deepEqual(pruned.closed.map((tab) => tab.id), ["tab-1", "tab-3"]);
+  assert.deepEqual(pruned.closed.map((tab) => tab.id), ["tab-1", "tab-5"]);
   assert.deepEqual(pruned.skipped, [
     { id: "tab-2", ordinal: 2, label: "Task 2", status: "running", traceId: "trace_two" },
+    { id: "tab-3", ordinal: 3, label: "Task 3", status: "error", traceId: "trace_three" },
+    { id: "tab-4", ordinal: 4, label: "Task 4", status: "aborted", traceId: "trace_four" },
   ]);
-  assert.deepEqual(kept.closed, ["tab-1", "tab-3"]);
-  assert.deepEqual([...kept.turnTabs.keys()], ["tab-2"]);
+  assert.deepEqual(kept.closed, ["tab-1", "tab-5"]);
+  assert.deepEqual([...kept.turnTabs.keys()], ["tab-2", "tab-3", "tab-4"]);
 
   const forced = createTurnTabHost(tabs);
   const all = BrowserHost.prototype.pruneTurnTabs.call(forced.fixture, true);
@@ -1177,8 +1297,10 @@ test("pruning browser tabs keeps running turns unless they are forced", () => {
     [1, "ready"],
     [2, "running"],
     [3, "error"],
+    [4, "aborted"],
+    [5, "error"],
   ]);
-  assert.deepEqual(forced.closed, ["tab-1", "tab-2", "tab-3"]);
+  assert.deepEqual(forced.closed, ["tab-1", "tab-2", "tab-3", "tab-4", "tab-5"]);
   assert.equal(forced.turnTabs.size, 0);
 });
 

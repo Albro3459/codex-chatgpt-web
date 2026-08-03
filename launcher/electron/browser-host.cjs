@@ -70,6 +70,10 @@ const CHATGPT_VIEWPORT_CSS = `
 
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
+function isLiveTurnTab(tab) {
+  return tab.ended !== true;
+}
+
 function visibleElementScript(selector) {
   return `Array.from(document.querySelectorAll(${JSON.stringify(selector)})).find((element) => {
     const style = getComputedStyle(element);
@@ -174,7 +178,7 @@ class BrowserHost {
   }
 
   get activeTraceId() {
-    return [...this.turnTabs.values()].find((tab) => tab.status === "running")?.traceId || null;
+    return [...this.turnTabs.values()].find(isLiveTurnTab)?.traceId || null;
   }
 
   tabSnapshot(tab) {
@@ -221,21 +225,6 @@ class BrowserHost {
         backgroundThrottling: false,
       },
     });
-    const cleanup = () => {
-      this.turnTabs.delete(id);
-      try { this.window.contentView.removeChildView(view); } catch {}
-      try {
-        if (!view.webContents.isDestroyed()) view.webContents.close();
-      } catch {}
-    };
-    if (evictedId) {
-      try {
-        this.closeTab(evictedId);
-      } catch (error) {
-        cleanup();
-        throw error;
-      }
-    }
     const tab = {
       id,
       surfaceId,
@@ -251,22 +240,40 @@ class BrowserHost {
       message: "ChatGPT is working",
       ended: false,
     };
-    this.turnTabs.set(id, tab);
+    let added = false;
+    const cleanup = () => {
+      if (added) {
+        try { this.window.contentView.removeChildView(view); } catch {}
+      }
+      try {
+        if (!view.webContents.isDestroyed()) view.webContents.close();
+      } catch {}
+    };
     try {
-      this.window.contentView.addChildView(view);
       view.setBounds(this.bounds);
       view.setVisible(false);
       this.bindTurnContents(tab);
-      void view.webContents.loadURL(IDLE_BROWSER_URL).catch((error) => {
-        tab.status = "error";
-        tab.loading = false;
-        tab.message = error instanceof Error ? error.message : String(error);
-        this.publishState?.(this.snapshot());
-      });
+      added = true;
+      this.window.contentView.addChildView(view);
     } catch (error) {
       cleanup();
       throw error;
     }
+    if (evictedId) {
+      try {
+        this.closeTab(evictedId);
+      } catch (error) {
+        cleanup();
+        throw error;
+      }
+    }
+    this.turnTabs.set(id, tab);
+    void view.webContents.loadURL(IDLE_BROWSER_URL).catch((error) => {
+      tab.status = "error";
+      tab.loading = false;
+      tab.message = error instanceof Error ? error.message : String(error);
+      this.publishState?.(this.snapshot());
+    });
     return tab;
   }
 
@@ -492,7 +499,7 @@ class BrowserHost {
     const tab = this.turnTabs.get(tabId);
     if (!tab) throw new Error("Browser tab does not exist");
     this.turnTabs.delete(tabId);
-    if (!tab.ended) {
+    if (isLiveTurnTab(tab)) {
       this.closedTurnOwners.set(tab.traceId, tab.helperPid);
       tab.status = "aborted";
     }
@@ -531,7 +538,7 @@ class BrowserHost {
       );
     }
     const tab = this.turnTabs.get(tabId);
-    if (tab.status === "running" && force !== true) {
+    if (isLiveTurnTab(tab) && force !== true) {
       throw new Error(
         `ChatGPT Web browser tab ${tab.ordinal} is still running turn ${tab.traceId}; pass --force to close it and abort that turn`,
       );
@@ -558,7 +565,7 @@ class BrowserHost {
         status: tab.status,
         traceId: tab.traceId,
       };
-      if (force !== true && tab.status === "running") {
+      if (force !== true && isLiveTurnTab(tab)) {
         skipped.push(entry);
         continue;
       }
@@ -720,7 +727,7 @@ class BrowserHost {
     }
     const existing = [...this.turnTabs.values()].find((tab) => tab.traceId === traceId);
     if (existing) {
-      if (existing.status === "running" && existing.helperPid !== helperPid) {
+      if (isLiveTurnTab(existing) && existing.helperPid !== helperPid) {
         throw new Error(`ChatGPT browser turn ${traceId} is owned by another helper process`);
       }
       existing.helperPid = helperPid;
