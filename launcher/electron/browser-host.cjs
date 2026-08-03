@@ -231,6 +231,7 @@ class BrowserHost {
       url: IDLE_BROWSER_URL,
       loading: true,
       message: "ChatGPT is working",
+      ended: false,
     };
     this.turnTabs.set(id, tab);
     this.window.contentView.addChildView(view);
@@ -468,7 +469,7 @@ class BrowserHost {
     const tab = this.turnTabs.get(tabId);
     if (!tab) throw new Error("Browser tab does not exist");
     this.turnTabs.delete(tabId);
-    if (tab.status === "running") {
+    if (!tab.ended) {
       this.closedTurnOwners.set(tab.traceId, tab.helperPid);
       tab.status = "aborted";
     }
@@ -703,6 +704,7 @@ class BrowserHost {
       existing.status = "running";
       existing.loading = true;
       existing.message = "ChatGPT is working";
+      existing.ended = false;
       if (!existing.view.webContents.isDestroyed()) {
         existing.view.webContents.setBackgroundThrottling(false);
       }
@@ -741,6 +743,7 @@ class BrowserHost {
     tab.status = status === "completed" ? "ready" : status === "aborted" ? "aborted" : "error";
     tab.message = status === "completed" ? "Task completed" : message || `ChatGPT turn ${status}`;
     tab.loading = false;
+    tab.ended = true;
     if (!tab.view.webContents.isDestroyed()) tab.view.webContents.setBackgroundThrottling(true);
     if (hideAfterTurn && !this.activeTraceId) this.hide();
     if (status === "completed") {

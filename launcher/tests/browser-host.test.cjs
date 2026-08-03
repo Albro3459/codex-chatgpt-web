@@ -801,6 +801,73 @@ test("closing a running browser tab preserves ownership until its helper reports
   assert.equal(fixture.selectedTabId, "home");
 });
 
+test("closing an unended errored browser tab preserves ownership until its helper ends", async () => {
+  const tab = {
+    id: "tab-error",
+    traceId: "trace_error_before_end",
+    helperPid: 444,
+    status: "error",
+    ended: false,
+    view: {
+      webContents: { isDestroyed: () => false, close() {} },
+    },
+  };
+  const fixture = {
+    turnTabs: new Map([[tab.id, tab]]),
+    closedTurnOwners: new Map(),
+    selectedTabId: tab.id,
+    window: { contentView: { removeChildView() {} } },
+    syncViewVisibility() {},
+    snapshot: () => ({ tabs: [] }),
+    publishState() {},
+    writeDescriptor() {},
+    logger: { info() {} },
+  };
+
+  BrowserHost.prototype.closeTab.call(fixture, tab.id);
+
+  assert.equal(tab.status, "aborted");
+  assert.equal(fixture.closedTurnOwners.get(tab.traceId), tab.helperPid);
+  await BrowserHost.prototype.endTurn.call(
+    fixture,
+    tab.traceId,
+    tab.helperPid,
+    "failed",
+    false,
+    "helper failed after tab closed",
+  );
+  assert.equal(fixture.closedTurnOwners.has(tab.traceId), false);
+});
+
+test("closing an ended errored browser tab does not claim a live turn owner", () => {
+  const tab = {
+    id: "tab-ended-error",
+    traceId: "trace_ended_error",
+    helperPid: 555,
+    status: "error",
+    ended: true,
+    view: {
+      webContents: { isDestroyed: () => false, close() {} },
+    },
+  };
+  const fixture = {
+    turnTabs: new Map([[tab.id, tab]]),
+    closedTurnOwners: new Map(),
+    selectedTabId: tab.id,
+    window: { contentView: { removeChildView() {} } },
+    syncViewVisibility() {},
+    snapshot: () => ({ tabs: [] }),
+    publishState() {},
+    writeDescriptor() {},
+    logger: { info() {} },
+  };
+
+  BrowserHost.prototype.closeTab.call(fixture, tab.id);
+
+  assert.equal(tab.status, "error");
+  assert.equal(fixture.closedTurnOwners.has(tab.traceId), false);
+});
+
 test("a later provider round reuses its task tab and restores active ownership", () => {
   const throttling = [];
   const tab = {
@@ -811,6 +878,7 @@ test("a later provider round reuses its task tab and restores active ownership",
     status: "ready",
     loading: false,
     message: "Task completed",
+    ended: true,
     view: {
       webContents: {
         isDestroyed: () => false,
@@ -837,6 +905,7 @@ test("a later provider round reuses its task tab and restores active ownership",
   assert.equal(tab.status, "running");
   assert.equal(tab.loading, true);
   assert.equal(tab.message, "ChatGPT is working");
+  assert.equal(tab.ended, false);
   assert.equal(fixture.selectedTabId, tab.id);
   assert.deepEqual(throttling, [false]);
   assert.deepEqual(events, ["visible", "published", "descriptor", "browser.tab_reused"]);
@@ -1038,6 +1107,7 @@ test("ending one browser turn does not stop another running tab", async () => {
   );
 
   assert.equal(ended.status, "ready");
+  assert.equal(ended.ended, true);
   assert.equal(active.status, "running");
   assert.equal(fixture.activeTraceId, active.traceId);
 });
